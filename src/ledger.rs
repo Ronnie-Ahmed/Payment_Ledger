@@ -38,23 +38,28 @@ pub async fn post_transfer_in_tx(
     from: Uuid, to: Uuid, amount: i64, description: &str,
 ) -> Result<Uuid, LedgerError> {
     if amount <= 0 { return Err(LedgerError::Invalid("amount must be positive")); }
-    if from == to { return Err(LedgerError::Invalid("same account")); }
+    if from == to  { return Err(LedgerError::Invalid("same account")); }
 
-    let entry_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO journal_entries (description) VALUES ($1) RETURNING id",
+    // lock both rows in a fixed order -> no deadlocks between A->B and B->A
+    let (lo, hi) = if from < to { (from, to) } else { (to, from) };
+    let accts: Vec<(Uuid, bool, String)> = sqlx::query_as(
+        "SELECT id, allow_negative, currency FROM accounts
+         WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE",
     )
-    .bind(description).fetch_one(&mut **tx).await?;
+    .bind(&[lo, hi][..])
+    .fetch_all(&mut **tx)
+    .await?;
 
-    for (account, signed) in [(from, -amount), (to, amount)] {
-        sqlx::query(
-            "INSERT INTO postings (journal_entry_id, account_id, amount)
-             VALUES ($1, $2, $3)",
-        )
-        .bind(entry_id).bind(account).bind(signed)
-        .execute(&mut **tx).await?;
+    if accts.len() != 2 { return Err(LedgerError::AccountNotFound); }
+    if accts[0].2 != accts[1].2 { return Err(LedgerError::CurrencyMismatch); }
+
+    let from_allows_negative = accts.iter().find(|a| a.0 == from).unwrap().1;
+    if !from_allows_negative {
+        let bal: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(amount), 0)::BIGINT FROM postings WHERE account_id = $1",
+        ).bind(from).fetch_one(&mut **tx).await?;
+        if bal - amount < 0 { return Err(LedgerError::InsufficientFunds); }
     }
-    Ok(entry_id)
-}
 
 pub async fn post_transfer(
     pool: &PgPool, from: Uuid, to: Uuid, amount: i64, description: &str,
